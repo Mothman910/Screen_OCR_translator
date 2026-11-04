@@ -6,20 +6,41 @@ Moduł do rozpoznawania tekstu z obrazów.
 """
 
 import os
+import base64
 import cv2
 import numpy as np
 import pytesseract
 import logging
 from pathlib import Path
 
+from translator import (
+    EngineUnavailable, DEFAULT_CLAUDE_MODEL, claude_api_key, claude_request,
+)
+
 logger = logging.getLogger('ocr_engine')
 
+# Etykiety silników OCR w interfejsie
+OCR_ENGINE_LABELS = {
+    'auto': 'Automatycznie (Claude, gdy jest klucz; inaczej Tesseract)',
+    'claude': 'Claude AI (najlepszy przy czcionkach z gier)',
+    'tesseract': 'Tesseract OCR (lokalny, darmowy)',
+}
+
+CLAUDE_OCR_PROMPT = (
+    "Transcribe all readable text in this screenshot region exactly as written, in natural "
+    "reading order. Keep line breaks between separate lines or UI elements, join words that "
+    "are visually wrapped within one sentence. Ignore icons and decorations. Do not translate, "
+    "explain or add anything. If there is no readable text, reply with an empty message."
+)
+
+
 class OCREngine:
-    """Silnik OCR wykorzystujący Tesseract do rozpoznawania tekstu z obrazów."""
+    """Silnik OCR: Claude (vision) lub Tesseract jako lokalny zapas."""
     
     def __init__(self, settings):
         """Inicjalizacja silnika OCR."""
         self.settings = settings
+        self.last_engine = None
         
         # Konfiguracja Tesseract
         self.configure_tesseract()
@@ -70,7 +91,54 @@ class OCREngine:
             logger.info(f"Ustawiono TESSDATA_PREFIX: {tessdata_path}")
     
     def process_image(self, image_path):
-        """Przetwarza obraz i rozpoznaje tekst."""
+        """Rozpoznaje tekst: najpierw Claude (jeśli wybrany i jest klucz), potem Tesseract."""
+        self.last_engine = None
+        engine = self.settings.get('ocr', 'engine', 'auto')
+        if engine in ('auto', 'claude'):
+            try:
+                text = self.process_with_claude(image_path)
+                self.last_engine = 'claude'
+                logger.info("Rozpoznawanie tekstu przez Claude zakończone pomyślnie")
+                return text
+            except EngineUnavailable as e:
+                log = logger.warning if engine == 'claude' else logger.info
+                log(f"OCR Claude niedostępny ({e}), używam Tesseract")
+            except Exception as e:  # noqa: BLE001 - zawsze mamy Tesseract jako zapas
+                logger.warning(f"OCR Claude nie powiódł się ({e}), używam Tesseract")
+        self.last_engine = 'tesseract'
+        return self.process_with_tesseract(image_path)
+
+    def process_with_claude(self, image_path):
+        """OCR przez Claude Haiku (vision): ok. 0,1 gr za zrzut."""
+        api_key = claude_api_key(self.settings)
+        if not api_key:
+            raise EngineUnavailable("brak klucza API Anthropic")
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Nie można wczytać obrazu: {image_path}")
+        height, width = image.shape[:2]
+        # Bardzo małe wycinki powiększamy, aby drobny tekst był czytelny
+        if max(height, width) < 400:
+            scale = 2 if max(height, width) >= 200 else 3
+            image = cv2.resize(image, (width * scale, height * scale), interpolation=cv2.INTER_CUBIC)
+        ok, buffer = cv2.imencode('.png', image)
+        if not ok:
+            raise ValueError("Nie udało się zakodować obrazu")
+        data = base64.standard_b64encode(buffer.tobytes()).decode('ascii')
+        content = [
+            {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': data}},
+            {'type': 'text', 'text': CLAUDE_OCR_PROMPT},
+        ]
+        return claude_request(
+            api_key,
+            model=self.settings.get('translation', 'claude_model', DEFAULT_CLAUDE_MODEL),
+            system="You are a precise OCR engine. Output only the transcribed text.",
+            user_content=content,
+            timeout=30.0,
+        )
+
+    def process_with_tesseract(self, image_path):
+        """Przetwarza obraz i rozpoznaje tekst przez Tesseract."""
         try:
             logger.info(f"Przetwarzanie obrazu: {image_path}")
             

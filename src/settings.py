@@ -44,7 +44,7 @@ class Settings:
                 'predefined_hotkeys': ['Alt+F7', 'Ctrl+Alt+T', 'F9', 'Ctrl+Alt+S', 'Alt+Z', 'Ctrl+`']
             },
             'ocr': {
-                'engine': 'tesseract',
+                'engine': 'auto',  # auto (Claude gdy jest klucz, inaczej Tesseract), claude, tesseract
                 'language': 'eng',  # język dla OCR
                 'preprocess': True,  # wstępne przetwarzanie obrazu
                 'accuracy_mode': 'balanced',  # tryb dokładności: 'high', 'balanced', 'low'
@@ -59,10 +59,17 @@ class Settings:
                 'auto_copy': False,  # automatycznie kopiuj przetłumaczony tekst
                 'deepl_api_key': '',  # lub zmienna środowiskowa DEEPL_API_KEY
                 'anthropic_api_key': '',  # lub zmienna środowiskowa ANTHROPIC_API_KEY
-                'claude_model': 'claude-opus-5-5',
+                'claude_model': 'claude-haiku-5-5',  # najtańszy: ułamek grosza za ekran
                 'mymemory_email': '',  # opcjonalnie: podnosi dzienny limit MyMemory
                 'timeout': 10,  # limit czasu zapytania (s)
-                'config_version': 2
+                'config_version': 3
+            },
+            'learning': {
+                'enabled': True,  # wskazówki do nauki w pop-upie
+                'use_ai': True,  # Claude Haiku, gdy jest klucz; inaczej darmowy tryb
+                'level': 'B1',  # poziom angielskiego: A2, B1, B2, C1
+                'max_hints': 3,  # ile nowych słów pokazywać
+                'max_reviews': 2  # ile powtórek pokazywać
             },
             'popup': {
                 'position': 'top-right',  # pozycja popup'u
@@ -112,16 +119,26 @@ class Settings:
 
         Wersja 2: domyślnym silnikiem zostaje DeepL (z Google jako fallback),
         bo nieoficjalne API Google często odmawia działania.
+        Wersja 3: domyślny model Claude to tani Haiku 5.5 zamiast Opus,
+        a OCR przechodzi w tryb "auto" (Claude, gdy jest klucz; inaczej Tesseract).
         """
         translation = user_settings.get('translation')
         if not isinstance(translation, dict):
             return False
-        if translation.get('config_version', 1) >= 2:
+        version = translation.get('config_version', 1)
+        if version >= 3:
             return False
-        if translation.get('engine', 'google') == 'google':
+        if version < 2 and translation.get('engine', 'google') == 'google':
             translation['engine'] = 'deepl'
             logger.info("Migracja ustawień: domyślny silnik tłumaczenia zmieniony na DeepL")
-        translation['config_version'] = 2
+        ocr = user_settings.get('ocr')
+        if isinstance(ocr, dict) and ocr.get('engine', 'tesseract') == 'tesseract':
+            ocr['engine'] = 'auto'
+            logger.info("Migracja ustawień: OCR w trybie automatycznym (Claude/Tesseract)")
+        if translation.get('claude_model') == 'claude-opus-5-5':
+            translation['claude_model'] = 'claude-haiku-5-5'
+            logger.info("Migracja ustawień: model Claude zmieniony na tańszy Haiku 5.5")
+        translation['config_version'] = 3
         return True
     
     def _merge_settings(self, user_settings, default_settings):
@@ -201,6 +218,7 @@ class SettingsDialog(QDialog):
         self.ocr_tab = QWidget()
         self.translation_tab = QWidget()
         self.popup_tab = QWidget()
+        self.learning_tab = QWidget()
         self.advanced_tab = QWidget()
         
         self.setup_general_tab()
@@ -208,6 +226,7 @@ class SettingsDialog(QDialog):
         self.setup_ocr_tab()
         self.setup_translation_tab()
         self.setup_popup_tab()
+        self.setup_learning_tab()
         self.setup_advanced_tab()
         
         self.tabs.addTab(self.general_tab, "Ogólne")
@@ -215,6 +234,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self.ocr_tab, "OCR")
         self.tabs.addTab(self.translation_tab, "Tłumaczenie")
         self.tabs.addTab(self.popup_tab, "Wyświetlanie")
+        self.tabs.addTab(self.learning_tab, "Nauka")
         self.tabs.addTab(self.advanced_tab, "Zaawansowane")
         
         layout.addWidget(self.tabs)
@@ -357,9 +377,19 @@ class SettingsDialog(QDialog):
         layout = QFormLayout()
         
         # Silnik OCR
+        from ocr_engine import OCR_ENGINE_LABELS
+
         self.ocr_engine_combo = QComboBox()
-        self.ocr_engine_combo.addItem("Tesseract OCR", "tesseract")
+        for engine, label in OCR_ENGINE_LABELS.items():
+            self.ocr_engine_combo.addItem(label, engine)
         layout.addRow("Silnik OCR:", self.ocr_engine_combo)
+        ocr_engine_info = QLabel(
+            "Claude czyta tekst prosto z obrazu (także stylizowane czcionki z gier) i kosztuje "
+            "ułamek grosza za zrzut. Wymaga klucza Claude z zakładki Tłumaczenie. "
+            "Gdy Claude jest niedostępny, program sam użyje Tesseract."
+        )
+        ocr_engine_info.setWordWrap(True)
+        layout.addRow("", ocr_engine_info)
         
         # Język OCR
         self.ocr_language_combo = QComboBox()
@@ -443,9 +473,9 @@ class SettingsDialog(QDialog):
         # Model Claude
         self.claude_model_combo = QComboBox()
         self.claude_model_combo.setEditable(True)
-        self.claude_model_combo.addItem("claude-opus-5-5 (najlepsza jakość)", "claude-opus-5-5")
-        self.claude_model_combo.addItem("claude-sonnet-5-5", "claude-sonnet-5-5")
-        self.claude_model_combo.addItem("claude-haiku-5-5 (najszybszy, najtańszy)", "claude-haiku-5-5")
+        self.claude_model_combo.addItem("claude-haiku-5-5 (zalecany: najtańszy, ~0,1 gr za ekran)", "claude-haiku-5-5")
+        self.claude_model_combo.addItem("claude-sonnet-5-5 (~20x drożej)", "claude-sonnet-5-5")
+        self.claude_model_combo.addItem("claude-opus-5-5 (~40x drożej)", "claude-opus-5-5")
         layout.addRow("Model Claude:", self.claude_model_combo)
 
         # Test tłumaczenia
@@ -531,6 +561,42 @@ class SettingsDialog(QDialog):
         
         self.popup_tab.setLayout(layout)
     
+    def setup_learning_tab(self):
+        """Konfiguracja zakładki nauki słownictwa."""
+        layout = QFormLayout()
+
+        self.learning_enabled_check = QCheckBox()
+        layout.addRow("Wskazówki do nauki w pop-upie:", self.learning_enabled_check)
+
+        self.learning_ai_check = QCheckBox()
+        layout.addRow("Wskazówki AI (Claude Haiku):", self.learning_ai_check)
+
+        self.learning_level_combo = QComboBox()
+        for level, label in [('A2', 'A2 - podstawowy'), ('B1', 'B1 - średni'),
+                             ('B2', 'B2 - średnio zaawansowany'), ('C1', 'C1 - zaawansowany')]:
+            self.learning_level_combo.addItem(label, level)
+        layout.addRow("Mój poziom angielskiego:", self.learning_level_combo)
+
+        self.max_hints_spin = QSpinBox()
+        self.max_hints_spin.setRange(0, 6)
+        layout.addRow("Nowe słowa na ekran:", self.max_hints_spin)
+
+        self.max_reviews_spin = QSpinBox()
+        self.max_reviews_spin.setRange(0, 5)
+        layout.addRow("Powtórki na ekran:", self.max_reviews_spin)
+
+        info = QLabel(
+            "Po każdym tłumaczeniu pop-up pokazuje kilka słów wartych nauki. Kliknij „✓ Znam”, "
+            "aby oznaczyć słowo jako nauczone: nie będzie już proponowane, a wróci do powtórki "
+            "po 1, 3, 7, 16, 35 i 90 dniach. Z kluczem Claude wskazówki tworzy AI "
+            "(koszt ułamka grosza), bez klucza działa darmowy tryb. Słownik otworzysz z menu "
+            "ikony w zasobniku: „Mój słownik”."
+        )
+        info.setWordWrap(True)
+        layout.addRow("", info)
+
+        self.learning_tab.setLayout(layout)
+
     def setup_advanced_tab(self):
         """Konfiguracja zakładki zaawansowanych ustawień."""
         layout = QFormLayout()
@@ -599,8 +665,15 @@ class SettingsDialog(QDialog):
         self.auto_copy_check.setChecked(self.settings.get('translation', 'auto_copy'))
         self.deepl_key_edit.setText(self.settings.get('translation', 'deepl_api_key', ''))
         self.anthropic_key_edit.setText(self.settings.get('translation', 'anthropic_api_key', ''))
-        self.set_claude_model(self.settings.get('translation', 'claude_model', 'claude-opus-5-5'))
+        self.set_claude_model(self.settings.get('translation', 'claude_model', 'claude-haiku-5-5'))
         
+        # Zakładka Nauka
+        self.learning_enabled_check.setChecked(bool(self.settings.get('learning', 'enabled', True)))
+        self.learning_ai_check.setChecked(bool(self.settings.get('learning', 'use_ai', True)))
+        self.set_combo_by_value(self.learning_level_combo, self.settings.get('learning', 'level', 'B1'))
+        self.max_hints_spin.setValue(int(self.settings.get('learning', 'max_hints', 3)))
+        self.max_reviews_spin.setValue(int(self.settings.get('learning', 'max_reviews', 2)))
+
         # Zakładka Wyświetlanie
         self.set_combo_by_value(self.position_combo, self.settings.get('popup', 'position'))
         self.width_spin.setValue(self.settings.get('popup', 'width'))
@@ -647,6 +720,13 @@ class SettingsDialog(QDialog):
         self.settings.set('translation', 'anthropic_api_key', self.anthropic_key_edit.text().strip())
         self.settings.set('translation', 'claude_model', self.get_claude_model())
         
+        # Zakładka Nauka
+        self.settings.set('learning', 'enabled', self.learning_enabled_check.isChecked())
+        self.settings.set('learning', 'use_ai', self.learning_ai_check.isChecked())
+        self.settings.set('learning', 'level', self.get_combo_value(self.learning_level_combo))
+        self.settings.set('learning', 'max_hints', self.max_hints_spin.value())
+        self.settings.set('learning', 'max_reviews', self.max_reviews_spin.value())
+
         # Zakładka Wyświetlanie
         self.settings.set('popup', 'position', self.get_combo_value(self.position_combo))
         self.settings.set('popup', 'width', self.width_spin.value())
@@ -679,7 +759,7 @@ class SettingsDialog(QDialog):
         text = self.claude_model_combo.currentText().strip()
         if index >= 0 and self.claude_model_combo.itemText(index) == text:
             return self.claude_model_combo.itemData(index)
-        return text.split(' ')[0] if text else 'claude-opus-5-5'
+        return text.split(' ')[0] if text else 'claude-haiku-5-5'
 
     def on_test_translation_clicked(self):
         """Tłumaczy przykładowe zdanie aktualnymi (niezapisanymi) ustawieniami."""

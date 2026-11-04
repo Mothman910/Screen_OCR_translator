@@ -21,6 +21,7 @@ from PyQt6.QtGui import QPixmap, QColor, QPainter, QPen, QGuiApplication, QScree
 # Importy wewnętrzne
 from ocr_engine import OCREngine
 from translator import Translator
+from learning import VocabularyStore, LearningAssistant
 from popup import TranslationPopup
 
 logger = logging.getLogger('screenshot')
@@ -28,13 +29,14 @@ logger = logging.getLogger('screenshot')
 class ScreenshotWorker(QThread):
     """Wątek do przetwarzania zrzutu ekranu, OCR i tłumaczenia."""
     
-    processing_done = pyqtSignal(str, str)  # Sygnały: tekst oryginalny, tłumaczenie
+    processing_done = pyqtSignal(str, str, object)  # tekst oryginalny, tłumaczenie, szczegóły (silniki, nauka)
     error_occurred = pyqtSignal(str)  # Sygnał: komunikat błędu
     
-    def __init__(self, image_path, settings):
+    def __init__(self, image_path, settings, vocabulary=None):
         super().__init__()
         self.image_path = image_path
         self.settings = settings
+        self.vocabulary = vocabulary
         self.mutex = QMutex()
         
     def run(self):
@@ -50,14 +52,25 @@ class ScreenshotWorker(QThread):
             original_text = ocr_engine.process_image(self.image_path)
             
             # Jeśli tekst został rozpoznany, przetłumacz go
+            learning = None
+            details = {'ocr_engine': ocr_engine.last_engine, 'engine': None, 'errors': {}}
             if original_text:
                 translated_text = translator.translate(original_text)
+                details['engine'] = translator.last_engine
+                details['errors'] = dict(translator.last_errors)
                 logger.info("Przetwarzanie zrzutu ekranu zakończone pomyślnie")
+                if self.vocabulary is not None:
+                    try:
+                        assistant = LearningAssistant(self.settings, self.vocabulary, translator)
+                        learning = assistant.build(original_text, translated_text)
+                    except Exception as e:  # wskazówki nie mogą blokować tłumaczenia
+                        logger.error(f"Błąd wskazówek do nauki: {e}")
             else:
                 translated_text = "Nie rozpoznano tekstu na obrazie."
                 logger.warning("Nie rozpoznano tekstu na obrazie")
             
-            self.processing_done.emit(original_text, translated_text)
+            details['learning'] = learning
+            self.processing_done.emit(original_text or "", translated_text, details)
             
         except Exception as e:
             logger.error(f"Błąd podczas przetwarzania zrzutu ekranu: {e}")
@@ -240,8 +253,11 @@ class ScreenshotTool(QObject):
         self.overlay = None
         self.worker = None
         
+        # Słownik nauki (wspólny dla pop-upu i wątku przetwarzania)
+        self.vocabulary = VocabularyStore.for_settings(self.settings)
+        
         # Inicjalizacja popup do wyświetlania tłumaczeń
-        self.popup = TranslationPopup(self.settings)
+        self.popup = TranslationPopup(self.settings, vocabulary=self.vocabulary)
         
         logger.info("Narzędzie zrzutu ekranu zainicjowane")
     
@@ -268,17 +284,17 @@ class ScreenshotTool(QObject):
         logger.info(f"Rozpoczęcie przetwarzania zrzutu ekranu: {image_path}")
         
         # Utworzenie i uruchomienie wątku do przetwarzania
-        self.worker = ScreenshotWorker(image_path, self.settings)
+        self.worker = ScreenshotWorker(image_path, self.settings, self.vocabulary)
         self.worker.processing_done.connect(self.show_translation_popup)
         self.worker.error_occurred.connect(self.on_processing_error)
         self.worker.start()
     
-    def show_translation_popup(self, original_text, translated_text):
+    def show_translation_popup(self, original_text, translated_text, details=None):
         """Wyświetla popup z tłumaczeniem."""
         logger.info("Wyświetlanie popup z tłumaczeniem")
         
         # Wyświetlenie tłumaczenia w popup
-        self.popup.show_translation(original_text, translated_text)
+        self.popup.show_translation(original_text, translated_text, details)
         
         # W wersji deweloperskiej możemy wyświetlić tekst w konsoli
         if os.environ.get('DEV_MODE') == '1':

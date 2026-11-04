@@ -160,6 +160,24 @@ class TranslatorChainTests(unittest.TestCase):
         t = Translator(FakeSettings(engine='google'), FakeSession({}))
         self.assertEqual(t.engine_order()[0], 'google')
 
+    def test_forced_engine_skips_chain_and_cache(self):
+        session = FakeSession({
+            'translate.googleapis.com': [google_ok('A'), google_ok('B')],
+            'mymemory': FakeResponse(200, {'responseStatus': 200, 'responseData': {'translatedText': 'M'}}),
+        })
+        settings = FakeSettings(engine='google')
+        self.assertEqual(Translator(settings, session).translate('Hi'), 'A')
+        t = Translator(settings, session)
+        self.assertEqual(t.translate('Hi', engines=['mymemory']), 'M')
+        self.assertEqual(t.last_engine, 'mymemory')
+        self.assertEqual(Translator(settings, session).translate('Hi'), 'A')  # cache bez zmian
+
+    def test_available_engines_depend_on_keys(self):
+        t = Translator(FakeSettings(), FakeSession({}))
+        self.assertEqual(t.available_engines(), ['google', 'mymemory'])
+        t = Translator(FakeSettings(deepl_api_key='k:fx', anthropic_api_key='a'), FakeSession({}))
+        self.assertEqual(t.available_engines(), ['deepl', 'claude', 'google', 'mymemory'])
+
     def test_empty_text(self):
         self.assertEqual(Translator(FakeSettings(), FakeSession({})).translate('   '), '')
 
@@ -200,9 +218,20 @@ class ClaudeEngineTests(unittest.TestCase):
             def __init__(self, **kwargs):
                 module.client_kwargs = kwargs
                 self.beta = types.SimpleNamespace(messages=Messages())
+                self.messages = Messages()
 
         module.Anthropic = Client
         return module
+
+    def test_default_claude_model_is_cheap_haiku(self):
+        response = types.SimpleNamespace(stop_reason='end_turn',
+                                         content=[types.SimpleNamespace(type='text', text='ok')])
+        fake = self._fake_anthropic(response)
+        with mock.patch.dict(sys.modules, {'anthropic': fake}):
+            Translator(FakeSettings(engine='claude', anthropic_api_key='k'), FakeSession({})).translate('x')
+        self.assertEqual(fake.created[0]['model'], 'claude-haiku-5-5')
+        self.assertNotIn('fallbacks', fake.created[0])
+        self.assertEqual(fake.created[0]['output_config'], {'effort': 'low'})
 
     def test_claude_translation_with_fallbacks(self):
         response = types.SimpleNamespace(
@@ -212,7 +241,8 @@ class ClaudeEngineTests(unittest.TestCase):
         )
         fake = self._fake_anthropic(response)
         with mock.patch.dict(sys.modules, {'anthropic': fake}):
-            t = Translator(FakeSettings(engine='claude', anthropic_api_key='sk-ant-x'), FakeSession({}))
+            t = Translator(FakeSettings(engine='claude', anthropic_api_key='sk-ant-x',
+                                        claude_model='claude-opus-5-5'), FakeSession({}))
             self.assertEqual(t.translate('Helo, travler!'), 'Witaj, wędrowcze!')
         params = fake.created[0]
         self.assertEqual(params['model'], 'claude-opus-5-5')

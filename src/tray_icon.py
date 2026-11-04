@@ -17,6 +17,7 @@ from PyQt6.QtGui import QIcon, QKeySequence, QAction
 # Importy wewnętrzne
 from screenshot import ScreenshotTool
 from settings import SettingsDialog
+from vocabulary_dialog import VocabularyDialog
 
 logger = logging.getLogger('tray_icon')
 
@@ -84,6 +85,11 @@ class SystemTrayIcon(QSystemTrayIcon):
         capture_action.triggered.connect(self.on_capture_action)
         menu.addAction(capture_action)
         
+        # Słownik nauki
+        vocabulary_action = QAction("Mój słownik", self)
+        vocabulary_action.triggered.connect(self.show_vocabulary)
+        menu.addAction(vocabulary_action)
+        
         menu.addSeparator()
         
         # Akcja ustawień
@@ -130,6 +136,12 @@ class SystemTrayIcon(QSystemTrayIcon):
         # Następujący kod będzie odkomentowany po implementacji okna ustawień
         settings_dialog = SettingsDialog(self.settings)
         settings_dialog.exec()
+        
+    def show_vocabulary(self):
+        """Wyświetla słownik nauki (słowa nauczone i do nauki)."""
+        logger.info("Wyświetlanie słownika")
+        dialog = VocabularyDialog(self.screenshot_tool.vocabulary)
+        dialog.exec()
         
     def show_about(self):
         """Wyświetla okno informacyjne o aplikacji."""
