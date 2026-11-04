@@ -6,6 +6,7 @@ Moduł obsługujący ustawienia aplikacji.
 """
 
 import os
+import copy
 import json
 import logging
 from pathlib import Path
@@ -50,10 +51,18 @@ class Settings:
                 'text_processing': True  # inteligentne przetwarzanie tekstu
             },
             'translation': {
-                'engine': 'google',  # google, deepl
+                'engine': 'deepl',  # deepl, claude, google, mymemory
+                # kolejność silników zapasowych, gdy główny zawiedzie
+                'fallback_engines': ['deepl', 'claude', 'google', 'mymemory'],
                 'source_lang': 'en',
                 'target_lang': 'pl',
-                'auto_copy': False  # automatycznie kopiuj przetłumaczony tekst
+                'auto_copy': False,  # automatycznie kopiuj przetłumaczony tekst
+                'deepl_api_key': '',  # lub zmienna środowiskowa DEEPL_API_KEY
+                'anthropic_api_key': '',  # lub zmienna środowiskowa ANTHROPIC_API_KEY
+                'claude_model': 'claude-opus-5-5',
+                'mymemory_email': '',  # opcjonalnie: podnosi dzienny limit MyMemory
+                'timeout': 10,  # limit czasu zapytania (s)
+                'config_version': 2
             },
             'popup': {
                 'position': 'top-right',  # pozycja popup'u
@@ -82,22 +91,42 @@ class Settings:
                 with open(self.settings_file, 'r', encoding='utf-8') as f:
                     settings = json.load(f)
                 logger.info("Wczytano ustawienia z pliku")
+                migrated = self._migrate_settings(settings)
                 # Uzupełnianie brakujących ustawień domyślnymi
                 settings = self._merge_settings(settings, self.default_settings)
+                if migrated:
+                    self.save_settings(settings)
                 return settings
             except Exception as e:
                 logger.error(f"Błąd wczytywania ustawień: {e}")
-                return self.default_settings.copy()
+                return copy.deepcopy(self.default_settings)
         else:
             logger.info("Tworzenie domyślnych ustawień")
             # Utworzenie katalogu ustawień, jeśli nie istnieje
             os.makedirs(self.settings_dir, exist_ok=True)
             self.save_settings(self.default_settings)
-            return self.default_settings.copy()
+            return copy.deepcopy(self.default_settings)
+
+    def _migrate_settings(self, user_settings):
+        """Aktualizuje ustawienia zapisane przez starsze wersje programu.
+
+        Wersja 2: domyślnym silnikiem zostaje DeepL (z Google jako fallback),
+        bo nieoficjalne API Google często odmawia działania.
+        """
+        translation = user_settings.get('translation')
+        if not isinstance(translation, dict):
+            return False
+        if translation.get('config_version', 1) >= 2:
+            return False
+        if translation.get('engine', 'google') == 'google':
+            translation['engine'] = 'deepl'
+            logger.info("Migracja ustawień: domyślny silnik tłumaczenia zmieniony na DeepL")
+        translation['config_version'] = 2
+        return True
     
     def _merge_settings(self, user_settings, default_settings):
         """Łączy ustawienia użytkownika z domyślnymi, uzupełniając brakujące wartości."""
-        merged_settings = default_settings.copy()
+        merged_settings = copy.deepcopy(default_settings)
         
         for category, values in user_settings.items():
             if category in merged_settings:
@@ -384,11 +413,50 @@ class SettingsDialog(QDialog):
         """Konfiguracja zakładki tłumaczenia."""
         layout = QFormLayout()
         
+        from translator import ENGINE_LABELS
+
         # Silnik tłumaczenia
         self.translation_engine_combo = QComboBox()
-        self.translation_engine_combo.addItem("Google Translate", "google")
-        self.translation_engine_combo.addItem("DeepL", "deepl")
+        for engine, label in ENGINE_LABELS.items():
+            self.translation_engine_combo.addItem(label, engine)
         layout.addRow("Silnik tłumaczenia:", self.translation_engine_combo)
+
+        engine_info = QLabel(
+            "Jeśli wybrany silnik zawiedzie, program automatycznie spróbuje kolejnych: "
+            "DeepL → Claude → Google → MyMemory. Silniki bez klucza API są pomijane."
+        )
+        engine_info.setWordWrap(True)
+        layout.addRow("", engine_info)
+
+        # Klucz API DeepL
+        self.deepl_key_edit = QLineEdit()
+        self.deepl_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.deepl_key_edit.setPlaceholderText("Darmowy klucz z deepl.com/pro-api (kończy się na :fx)")
+        layout.addRow("Klucz API DeepL:", self.deepl_key_edit)
+
+        # Klucz API Anthropic (Claude)
+        self.anthropic_key_edit = QLineEdit()
+        self.anthropic_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.anthropic_key_edit.setPlaceholderText("sk-ant-... z platform.claude.com")
+        layout.addRow("Klucz API Claude:", self.anthropic_key_edit)
+
+        # Model Claude
+        self.claude_model_combo = QComboBox()
+        self.claude_model_combo.setEditable(True)
+        self.claude_model_combo.addItem("claude-opus-5-5 (najlepsza jakość)", "claude-opus-5-5")
+        self.claude_model_combo.addItem("claude-sonnet-5-5", "claude-sonnet-5-5")
+        self.claude_model_combo.addItem("claude-haiku-5-5 (najszybszy, najtańszy)", "claude-haiku-5-5")
+        layout.addRow("Model Claude:", self.claude_model_combo)
+
+        # Test tłumaczenia
+        self.test_translation_button = QPushButton("Testuj tłumaczenie")
+        self.test_translation_button.clicked.connect(self.on_test_translation_clicked)
+        self.test_translation_result = QLabel("")
+        self.test_translation_result.setWordWrap(True)
+        test_layout = QVBoxLayout()
+        test_layout.addWidget(self.test_translation_button)
+        test_layout.addWidget(self.test_translation_result)
+        layout.addRow("", test_layout)
         
         # Język źródłowy
         self.source_language_combo = QComboBox()
@@ -529,6 +597,9 @@ class SettingsDialog(QDialog):
         self.set_combo_by_value(self.source_language_combo, self.settings.get('translation', 'source_lang'))
         self.set_combo_by_value(self.target_language_combo, self.settings.get('translation', 'target_lang'))
         self.auto_copy_check.setChecked(self.settings.get('translation', 'auto_copy'))
+        self.deepl_key_edit.setText(self.settings.get('translation', 'deepl_api_key', ''))
+        self.anthropic_key_edit.setText(self.settings.get('translation', 'anthropic_api_key', ''))
+        self.set_claude_model(self.settings.get('translation', 'claude_model', 'claude-opus-5-5'))
         
         # Zakładka Wyświetlanie
         self.set_combo_by_value(self.position_combo, self.settings.get('popup', 'position'))
@@ -572,6 +643,9 @@ class SettingsDialog(QDialog):
         self.settings.set('translation', 'source_lang', self.get_combo_value(self.source_language_combo))
         self.settings.set('translation', 'target_lang', self.get_combo_value(self.target_language_combo))
         self.settings.set('translation', 'auto_copy', self.auto_copy_check.isChecked())
+        self.settings.set('translation', 'deepl_api_key', self.deepl_key_edit.text().strip())
+        self.settings.set('translation', 'anthropic_api_key', self.anthropic_key_edit.text().strip())
+        self.settings.set('translation', 'claude_model', self.get_claude_model())
         
         # Zakładka Wyświetlanie
         self.settings.set('popup', 'position', self.get_combo_value(self.position_combo))
@@ -591,6 +665,56 @@ class SettingsDialog(QDialog):
         # Konfiguracja autostartu z Windows
         self.configure_autostart()
     
+    def set_claude_model(self, model):
+        """Ustawia model Claude w polu wyboru (także własny, spoza listy)."""
+        for i in range(self.claude_model_combo.count()):
+            if self.claude_model_combo.itemData(i) == model:
+                self.claude_model_combo.setCurrentIndex(i)
+                return
+        self.claude_model_combo.setEditText(model)
+
+    def get_claude_model(self):
+        """Zwraca identyfikator wybranego (lub wpisanego) modelu Claude."""
+        index = self.claude_model_combo.currentIndex()
+        text = self.claude_model_combo.currentText().strip()
+        if index >= 0 and self.claude_model_combo.itemText(index) == text:
+            return self.claude_model_combo.itemData(index)
+        return text.split(' ')[0] if text else 'claude-opus-5-5'
+
+    def on_test_translation_clicked(self):
+        """Tłumaczy przykładowe zdanie aktualnymi (niezapisanymi) ustawieniami."""
+        from translator import Translator, ENGINE_LABELS
+
+        overrides = {
+            'engine': self.get_combo_value(self.translation_engine_combo),
+            'deepl_api_key': self.deepl_key_edit.text().strip(),
+            'anthropic_api_key': self.anthropic_key_edit.text().strip(),
+            'claude_model': self.get_claude_model(),
+        }
+
+        class _PreviewSettings:
+            def __init__(self, base):
+                self.base = base
+
+            def get(self, category, key, default=None):
+                if category == 'translation' and key in overrides:
+                    return overrides[key]
+                return self.base.get(category, key, default)
+
+        self.test_translation_result.setText("Tłumaczenie...")
+        self.test_translation_result.repaint()
+        Translator.clear_cache()
+        translator = Translator(_PreviewSettings(self.settings))
+        result = translator.translate("The quick brown fox jumps over the lazy dog.")
+        if translator.last_engine:
+            label = ENGINE_LABELS.get(translator.last_engine, translator.last_engine)
+            lines = [f"✔ {label}: {result}"]
+        else:
+            lines = ["✘ Żaden silnik nie zadziałał."]
+        for engine, error in translator.last_errors.items():
+            lines.append(f"• {ENGINE_LABELS.get(engine, engine)}: {error}")
+        self.test_translation_result.setText("\n".join(lines))
+
     def configure_autostart(self):
         """Konfiguruje autostart aplikacji z systemem Windows."""
         # Implementacja autostartu z Windows (używając rejestru Windows)
