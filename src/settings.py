@@ -6,6 +6,7 @@ Moduł obsługujący ustawienia aplikacji.
 """
 
 import os
+import copy
 import json
 import logging
 from pathlib import Path
@@ -43,17 +44,32 @@ class Settings:
                 'predefined_hotkeys': ['Alt+F7', 'Ctrl+Alt+T', 'F9', 'Ctrl+Alt+S', 'Alt+Z', 'Ctrl+`']
             },
             'ocr': {
-                'engine': 'tesseract',
+                'engine': 'auto',  # auto (Claude gdy jest klucz, inaczej Tesseract), claude, tesseract
                 'language': 'eng',  # język dla OCR
                 'preprocess': True,  # wstępne przetwarzanie obrazu
                 'accuracy_mode': 'balanced',  # tryb dokładności: 'high', 'balanced', 'low'
                 'text_processing': True  # inteligentne przetwarzanie tekstu
             },
             'translation': {
-                'engine': 'google',  # google, deepl
+                'engine': 'deepl',  # deepl, claude, google, mymemory
+                # kolejność silników zapasowych, gdy główny zawiedzie
+                'fallback_engines': ['deepl', 'claude', 'google', 'mymemory'],
                 'source_lang': 'en',
                 'target_lang': 'pl',
-                'auto_copy': False  # automatycznie kopiuj przetłumaczony tekst
+                'auto_copy': False,  # automatycznie kopiuj przetłumaczony tekst
+                'deepl_api_key': '',  # lub zmienna środowiskowa DEEPL_API_KEY
+                'anthropic_api_key': '',  # lub zmienna środowiskowa ANTHROPIC_API_KEY
+                'claude_model': 'claude-haiku-5-5',  # najtańszy: ułamek grosza za ekran
+                'mymemory_email': '',  # opcjonalnie: podnosi dzienny limit MyMemory
+                'timeout': 10,  # limit czasu zapytania (s)
+                'config_version': 3
+            },
+            'learning': {
+                'enabled': True,  # wskazówki do nauki w pop-upie
+                'use_ai': True,  # Claude Haiku, gdy jest klucz; inaczej darmowy tryb
+                'level': 'B1',  # poziom angielskiego: A2, B1, B2, C1
+                'max_hints': 3,  # ile nowych słów pokazywać
+                'max_reviews': 2  # ile powtórek pokazywać
             },
             'popup': {
                 'position': 'top-right',  # pozycja popup'u
@@ -82,22 +98,52 @@ class Settings:
                 with open(self.settings_file, 'r', encoding='utf-8') as f:
                     settings = json.load(f)
                 logger.info("Wczytano ustawienia z pliku")
+                migrated = self._migrate_settings(settings)
                 # Uzupełnianie brakujących ustawień domyślnymi
                 settings = self._merge_settings(settings, self.default_settings)
+                if migrated:
+                    self.save_settings(settings)
                 return settings
             except Exception as e:
                 logger.error(f"Błąd wczytywania ustawień: {e}")
-                return self.default_settings.copy()
+                return copy.deepcopy(self.default_settings)
         else:
             logger.info("Tworzenie domyślnych ustawień")
             # Utworzenie katalogu ustawień, jeśli nie istnieje
             os.makedirs(self.settings_dir, exist_ok=True)
             self.save_settings(self.default_settings)
-            return self.default_settings.copy()
+            return copy.deepcopy(self.default_settings)
+
+    def _migrate_settings(self, user_settings):
+        """Aktualizuje ustawienia zapisane przez starsze wersje programu.
+
+        Wersja 2: domyślnym silnikiem zostaje DeepL (z Google jako fallback),
+        bo nieoficjalne API Google często odmawia działania.
+        Wersja 3: domyślny model Claude to tani Haiku 5.5 zamiast Opus,
+        a OCR przechodzi w tryb "auto" (Claude, gdy jest klucz; inaczej Tesseract).
+        """
+        translation = user_settings.get('translation')
+        if not isinstance(translation, dict):
+            return False
+        version = translation.get('config_version', 1)
+        if version >= 3:
+            return False
+        if version < 2 and translation.get('engine', 'google') == 'google':
+            translation['engine'] = 'deepl'
+            logger.info("Migracja ustawień: domyślny silnik tłumaczenia zmieniony na DeepL")
+        ocr = user_settings.get('ocr')
+        if isinstance(ocr, dict) and ocr.get('engine', 'tesseract') == 'tesseract':
+            ocr['engine'] = 'auto'
+            logger.info("Migracja ustawień: OCR w trybie automatycznym (Claude/Tesseract)")
+        if translation.get('claude_model') == 'claude-opus-5-5':
+            translation['claude_model'] = 'claude-haiku-5-5'
+            logger.info("Migracja ustawień: model Claude zmieniony na tańszy Haiku 5.5")
+        translation['config_version'] = 3
+        return True
     
     def _merge_settings(self, user_settings, default_settings):
         """Łączy ustawienia użytkownika z domyślnymi, uzupełniając brakujące wartości."""
-        merged_settings = default_settings.copy()
+        merged_settings = copy.deepcopy(default_settings)
         
         for category, values in user_settings.items():
             if category in merged_settings:
@@ -172,6 +218,7 @@ class SettingsDialog(QDialog):
         self.ocr_tab = QWidget()
         self.translation_tab = QWidget()
         self.popup_tab = QWidget()
+        self.learning_tab = QWidget()
         self.advanced_tab = QWidget()
         
         self.setup_general_tab()
@@ -179,6 +226,7 @@ class SettingsDialog(QDialog):
         self.setup_ocr_tab()
         self.setup_translation_tab()
         self.setup_popup_tab()
+        self.setup_learning_tab()
         self.setup_advanced_tab()
         
         self.tabs.addTab(self.general_tab, "Ogólne")
@@ -186,6 +234,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self.ocr_tab, "OCR")
         self.tabs.addTab(self.translation_tab, "Tłumaczenie")
         self.tabs.addTab(self.popup_tab, "Wyświetlanie")
+        self.tabs.addTab(self.learning_tab, "Nauka")
         self.tabs.addTab(self.advanced_tab, "Zaawansowane")
         
         layout.addWidget(self.tabs)
@@ -328,9 +377,19 @@ class SettingsDialog(QDialog):
         layout = QFormLayout()
         
         # Silnik OCR
+        from ocr_engine import OCR_ENGINE_LABELS
+
         self.ocr_engine_combo = QComboBox()
-        self.ocr_engine_combo.addItem("Tesseract OCR", "tesseract")
+        for engine, label in OCR_ENGINE_LABELS.items():
+            self.ocr_engine_combo.addItem(label, engine)
         layout.addRow("Silnik OCR:", self.ocr_engine_combo)
+        ocr_engine_info = QLabel(
+            "Claude czyta tekst prosto z obrazu (także stylizowane czcionki z gier) i kosztuje "
+            "ułamek grosza za zrzut. Wymaga klucza Claude z zakładki Tłumaczenie. "
+            "Gdy Claude jest niedostępny, program sam użyje Tesseract."
+        )
+        ocr_engine_info.setWordWrap(True)
+        layout.addRow("", ocr_engine_info)
         
         # Język OCR
         self.ocr_language_combo = QComboBox()
@@ -384,11 +443,50 @@ class SettingsDialog(QDialog):
         """Konfiguracja zakładki tłumaczenia."""
         layout = QFormLayout()
         
+        from translator import ENGINE_LABELS
+
         # Silnik tłumaczenia
         self.translation_engine_combo = QComboBox()
-        self.translation_engine_combo.addItem("Google Translate", "google")
-        self.translation_engine_combo.addItem("DeepL", "deepl")
+        for engine, label in ENGINE_LABELS.items():
+            self.translation_engine_combo.addItem(label, engine)
         layout.addRow("Silnik tłumaczenia:", self.translation_engine_combo)
+
+        engine_info = QLabel(
+            "Jeśli wybrany silnik zawiedzie, program automatycznie spróbuje kolejnych: "
+            "DeepL → Claude → Google → MyMemory. Silniki bez klucza API są pomijane."
+        )
+        engine_info.setWordWrap(True)
+        layout.addRow("", engine_info)
+
+        # Klucz API DeepL
+        self.deepl_key_edit = QLineEdit()
+        self.deepl_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.deepl_key_edit.setPlaceholderText("Darmowy klucz z deepl.com/pro-api (kończy się na :fx)")
+        layout.addRow("Klucz API DeepL:", self.deepl_key_edit)
+
+        # Klucz API Anthropic (Claude)
+        self.anthropic_key_edit = QLineEdit()
+        self.anthropic_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.anthropic_key_edit.setPlaceholderText("sk-ant-... z platform.claude.com")
+        layout.addRow("Klucz API Claude:", self.anthropic_key_edit)
+
+        # Model Claude
+        self.claude_model_combo = QComboBox()
+        self.claude_model_combo.setEditable(True)
+        self.claude_model_combo.addItem("claude-haiku-5-5 (zalecany: najtańszy, ~0,1 gr za ekran)", "claude-haiku-5-5")
+        self.claude_model_combo.addItem("claude-sonnet-5-5 (~20x drożej)", "claude-sonnet-5-5")
+        self.claude_model_combo.addItem("claude-opus-5-5 (~40x drożej)", "claude-opus-5-5")
+        layout.addRow("Model Claude:", self.claude_model_combo)
+
+        # Test tłumaczenia
+        self.test_translation_button = QPushButton("Testuj tłumaczenie")
+        self.test_translation_button.clicked.connect(self.on_test_translation_clicked)
+        self.test_translation_result = QLabel("")
+        self.test_translation_result.setWordWrap(True)
+        test_layout = QVBoxLayout()
+        test_layout.addWidget(self.test_translation_button)
+        test_layout.addWidget(self.test_translation_result)
+        layout.addRow("", test_layout)
         
         # Język źródłowy
         self.source_language_combo = QComboBox()
@@ -463,6 +561,42 @@ class SettingsDialog(QDialog):
         
         self.popup_tab.setLayout(layout)
     
+    def setup_learning_tab(self):
+        """Konfiguracja zakładki nauki słownictwa."""
+        layout = QFormLayout()
+
+        self.learning_enabled_check = QCheckBox()
+        layout.addRow("Wskazówki do nauki w pop-upie:", self.learning_enabled_check)
+
+        self.learning_ai_check = QCheckBox()
+        layout.addRow("Wskazówki AI (Claude Haiku):", self.learning_ai_check)
+
+        self.learning_level_combo = QComboBox()
+        for level, label in [('A2', 'A2 - podstawowy'), ('B1', 'B1 - średni'),
+                             ('B2', 'B2 - średnio zaawansowany'), ('C1', 'C1 - zaawansowany')]:
+            self.learning_level_combo.addItem(label, level)
+        layout.addRow("Mój poziom angielskiego:", self.learning_level_combo)
+
+        self.max_hints_spin = QSpinBox()
+        self.max_hints_spin.setRange(0, 6)
+        layout.addRow("Nowe słowa na ekran:", self.max_hints_spin)
+
+        self.max_reviews_spin = QSpinBox()
+        self.max_reviews_spin.setRange(0, 5)
+        layout.addRow("Powtórki na ekran:", self.max_reviews_spin)
+
+        info = QLabel(
+            "Po każdym tłumaczeniu pop-up pokazuje kilka słów wartych nauki. Kliknij „✓ Znam”, "
+            "aby oznaczyć słowo jako nauczone: nie będzie już proponowane, a wróci do powtórki "
+            "po 1, 3, 7, 16, 35 i 90 dniach. Z kluczem Claude wskazówki tworzy AI "
+            "(koszt ułamka grosza), bez klucza działa darmowy tryb. Słownik otworzysz z menu "
+            "ikony w zasobniku: „Mój słownik”."
+        )
+        info.setWordWrap(True)
+        layout.addRow("", info)
+
+        self.learning_tab.setLayout(layout)
+
     def setup_advanced_tab(self):
         """Konfiguracja zakładki zaawansowanych ustawień."""
         layout = QFormLayout()
@@ -529,7 +663,17 @@ class SettingsDialog(QDialog):
         self.set_combo_by_value(self.source_language_combo, self.settings.get('translation', 'source_lang'))
         self.set_combo_by_value(self.target_language_combo, self.settings.get('translation', 'target_lang'))
         self.auto_copy_check.setChecked(self.settings.get('translation', 'auto_copy'))
+        self.deepl_key_edit.setText(self.settings.get('translation', 'deepl_api_key', ''))
+        self.anthropic_key_edit.setText(self.settings.get('translation', 'anthropic_api_key', ''))
+        self.set_claude_model(self.settings.get('translation', 'claude_model', 'claude-haiku-5-5'))
         
+        # Zakładka Nauka
+        self.learning_enabled_check.setChecked(bool(self.settings.get('learning', 'enabled', True)))
+        self.learning_ai_check.setChecked(bool(self.settings.get('learning', 'use_ai', True)))
+        self.set_combo_by_value(self.learning_level_combo, self.settings.get('learning', 'level', 'B1'))
+        self.max_hints_spin.setValue(int(self.settings.get('learning', 'max_hints', 3)))
+        self.max_reviews_spin.setValue(int(self.settings.get('learning', 'max_reviews', 2)))
+
         # Zakładka Wyświetlanie
         self.set_combo_by_value(self.position_combo, self.settings.get('popup', 'position'))
         self.width_spin.setValue(self.settings.get('popup', 'width'))
@@ -572,7 +716,17 @@ class SettingsDialog(QDialog):
         self.settings.set('translation', 'source_lang', self.get_combo_value(self.source_language_combo))
         self.settings.set('translation', 'target_lang', self.get_combo_value(self.target_language_combo))
         self.settings.set('translation', 'auto_copy', self.auto_copy_check.isChecked())
+        self.settings.set('translation', 'deepl_api_key', self.deepl_key_edit.text().strip())
+        self.settings.set('translation', 'anthropic_api_key', self.anthropic_key_edit.text().strip())
+        self.settings.set('translation', 'claude_model', self.get_claude_model())
         
+        # Zakładka Nauka
+        self.settings.set('learning', 'enabled', self.learning_enabled_check.isChecked())
+        self.settings.set('learning', 'use_ai', self.learning_ai_check.isChecked())
+        self.settings.set('learning', 'level', self.get_combo_value(self.learning_level_combo))
+        self.settings.set('learning', 'max_hints', self.max_hints_spin.value())
+        self.settings.set('learning', 'max_reviews', self.max_reviews_spin.value())
+
         # Zakładka Wyświetlanie
         self.settings.set('popup', 'position', self.get_combo_value(self.position_combo))
         self.settings.set('popup', 'width', self.width_spin.value())
@@ -591,6 +745,56 @@ class SettingsDialog(QDialog):
         # Konfiguracja autostartu z Windows
         self.configure_autostart()
     
+    def set_claude_model(self, model):
+        """Ustawia model Claude w polu wyboru (także własny, spoza listy)."""
+        for i in range(self.claude_model_combo.count()):
+            if self.claude_model_combo.itemData(i) == model:
+                self.claude_model_combo.setCurrentIndex(i)
+                return
+        self.claude_model_combo.setEditText(model)
+
+    def get_claude_model(self):
+        """Zwraca identyfikator wybranego (lub wpisanego) modelu Claude."""
+        index = self.claude_model_combo.currentIndex()
+        text = self.claude_model_combo.currentText().strip()
+        if index >= 0 and self.claude_model_combo.itemText(index) == text:
+            return self.claude_model_combo.itemData(index)
+        return text.split(' ')[0] if text else 'claude-haiku-5-5'
+
+    def on_test_translation_clicked(self):
+        """Tłumaczy przykładowe zdanie aktualnymi (niezapisanymi) ustawieniami."""
+        from translator import Translator, ENGINE_LABELS
+
+        overrides = {
+            'engine': self.get_combo_value(self.translation_engine_combo),
+            'deepl_api_key': self.deepl_key_edit.text().strip(),
+            'anthropic_api_key': self.anthropic_key_edit.text().strip(),
+            'claude_model': self.get_claude_model(),
+        }
+
+        class _PreviewSettings:
+            def __init__(self, base):
+                self.base = base
+
+            def get(self, category, key, default=None):
+                if category == 'translation' and key in overrides:
+                    return overrides[key]
+                return self.base.get(category, key, default)
+
+        self.test_translation_result.setText("Tłumaczenie...")
+        self.test_translation_result.repaint()
+        Translator.clear_cache()
+        translator = Translator(_PreviewSettings(self.settings))
+        result = translator.translate("The quick brown fox jumps over the lazy dog.")
+        if translator.last_engine:
+            label = ENGINE_LABELS.get(translator.last_engine, translator.last_engine)
+            lines = [f"✔ {label}: {result}"]
+        else:
+            lines = ["✘ Żaden silnik nie zadziałał."]
+        for engine, error in translator.last_errors.items():
+            lines.append(f"• {ENGINE_LABELS.get(engine, engine)}: {error}")
+        self.test_translation_result.setText("\n".join(lines))
+
     def configure_autostart(self):
         """Konfiguruje autostart aplikacji z systemem Windows."""
         # Implementacja autostartu z Windows (używając rejestru Windows)

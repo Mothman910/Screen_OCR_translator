@@ -12,7 +12,7 @@
 
 - **Tesseract OCR** - silnik OCR do rozpoznawania tekstu z obrazu
 - **pytesseract** - wrapper Pythona dla Tesseract OCR
-- **Google Cloud Translation API** / **DeepL API** - do tłumaczenia tekstu
+- **DeepL API** (domyślnie) / **Claude** / **Google Translate** / **MyMemory** - łańcuch silników tłumaczenia z automatycznym przełączaniem przy awarii
 - **OpenCV-Python** - do przetwarzania obrazu przed OCR
 - **pynput** - do obsługi globalnych skrótów klawiszowych
 - **infi.systray** - do tworzenia ikony w zasobniku systemowym

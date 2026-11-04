@@ -11,9 +11,8 @@ pytesseract>=0.3.10
 opencv-python>=4.8.0
 Pillow>=10.0.0
 
-# Tłumaczenia
-googletrans>=4.0.0-rc1
-deepl>=1.15.0
+# Tłumaczenia (DeepL, Google i MyMemory przez requests; Claude przez oficjalne SDK)
+anthropic>=2.4.0
 
 # Narzędzia pomocnicze
 pyperclip>=1.8.2
